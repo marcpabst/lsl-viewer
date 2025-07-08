@@ -234,7 +234,7 @@ fn lsl_handler_thread(cmd_rx: Receiver<LslCommand>, resp_tx: Sender<LslResponse>
     loop {
         // Check for commands
         match cmd_rx.try_recv() {
-            Ok(LslCommand::RefreshStreams) => match lsl::resolve_streams(1.0) {
+            Ok(LslCommand::RefreshStreams) => match lsl::resolve_streams(3.0) {
                 Ok(streams) => {
                     available_streams = streams;
                     let stream_data: Vec<StreamData> = available_streams
