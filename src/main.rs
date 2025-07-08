@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 use eframe::egui;
 use egui::Stroke;
 use egui_plot::{AxisHints, GridInput, GridMark, Line, Plot, PlotPoints, Points, VLine};
@@ -12,6 +12,7 @@ const DEFAULT_TIME_WINDOW_SECONDS: f64 = 2.0; // Show last 10 seconds of data
 const BUFFER_SIZE: i32 = 360;
 const DEFAULT_SCALE: f64 = 25.0; // Default scale for data visualization
 const DEFAULT_DOWN_SAMPLE_FACTOR: usize = 1; // Default downsample factor
+const DEFAULT_BASELINE_TIME_WINDOW: f32 = 0.100; // Default baseline time window in seconds
 
 #[derive(Clone)]
 struct StreamData {
@@ -58,9 +59,12 @@ struct LslViewer {
     data_scale: f64,
     time_window_seconds: f64,
     downsample_factor: usize,
+    reference_channel: Option<usize>,
 
     // Data storage - now storing (timestamp, value) pairs
-    data_buffer: Vec<VecDeque<(f64, f32)>>,
+    //data_buffer: Vec<VecDeque<(f64, f32)>>,
+    data_buffer: Vec<VecDeque<f32>>, // Buffer for each channel
+    timestamp_buffer: VecDeque<f64>, // Separate buffer for timestamps
     channel_baselines: Vec<f64>,
 
     // Communication channels
@@ -92,6 +96,7 @@ impl LslViewer {
             time_window_seconds: DEFAULT_TIME_WINDOW_SECONDS,
             last_t: 0.0,
             downsample_factor: DEFAULT_DOWN_SAMPLE_FACTOR,
+            reference_channel: None,
 
             ..Default::default()
         };
@@ -144,6 +149,7 @@ impl LslViewer {
                         self.channel_count = channel_count;
                         self.selected_channels = vec![true; channel_count];
                         self.data_buffer = vec![VecDeque::new(); channel_count];
+                        self.timestamp_buffer = VecDeque::new();
                         self.channel_baselines = vec![0.0; channel_count];
                         self.channel_names = channels;
                         self.is_connected = true;
@@ -166,21 +172,32 @@ impl LslViewer {
                         self.status_message = format!("Error: {}", msg);
                     }
                     LslResponse::Data(sample) => {
-                        // Add data for each channel with timestamp
+                        // Add the timestamp to the timestamp buffer
+                        self.timestamp_buffer.push_back(sample.timestamp);
+                        // Add data for each channel
                         for (ch, &value) in sample.values.iter().enumerate() {
-                            if let Some(channel_buffer) = self.data_buffer.get_mut(ch) {
-                                channel_buffer.push_back((sample.timestamp, value));
+                            if let Some(channel_data_buffer) = self.data_buffer.get_mut(ch) {
+                                channel_data_buffer.push_back(value);
                             }
                         }
 
                         // Remove old data (older than TIME_WINDOW_SECONDS)
                         let cutoff_time = sample.timestamp - self.time_window_seconds;
-                        for channel_buffer in &mut self.data_buffer {
-                            while let Some(&(timestamp, _)) = channel_buffer.front() {
-                                if timestamp < cutoff_time {
-                                    channel_buffer.pop_front();
-                                } else {
-                                    break;
+                        let cuttoff_index = self
+                            .timestamp_buffer
+                            .iter()
+                            .rev()
+                            .position(|&t| t <= cutoff_time);
+
+                        if let Some(index) = cuttoff_index {
+                            // Remove old timestamps
+                            while self.timestamp_buffer.len() > index + 1 {
+                                self.timestamp_buffer.pop_front();
+                            }
+                            // Remove old data for each channel
+                            for channel_data in self.data_buffer.iter_mut() {
+                                while channel_data.len() > index + 1 {
+                                    channel_data.pop_front();
                                 }
                             }
                         }
@@ -195,13 +212,21 @@ impl LslViewer {
         for (i, channel_data) in self.data_buffer.iter_mut().enumerate() {
             if !channel_data.is_empty() {
                 let mut sum = 0.0;
-                let count = channel_data.len() as f64;
-
-                for &(_, value) in channel_data.iter() {
+                let mut count = 0;
+                let oldest_timestamp_to_inlcude = self.timestamp_buffer.back().unwrap_or(&0.0)
+                    - DEFAULT_BASELINE_TIME_WINDOW as f64;
+                for (_, &value) in self
+                    .timestamp_buffer
+                    .iter()
+                    .zip(channel_data.iter())
+                    .rev()
+                    .take_while(|&(t, _)| *t >= oldest_timestamp_to_inlcude)
+                {
                     sum += value as f64;
+                    count += 1;
                 }
 
-                let baseline = sum / count;
+                let baseline = sum / count as f64;
                 self.channel_baselines[i] = baseline;
             }
         }
@@ -462,6 +487,26 @@ impl eframe::App for LslViewer {
                                 });
                         });
 
+                        // Allow re-referencing to a specific channel
+                        ui.group(|ui| {
+                            egui::ComboBox::from_id_source("re_reference")
+                                .selected_text(if let Some(ref_idx) = self.reference_channel {
+                                    format!("Referenced to {}", self.channel_names[ref_idx])
+                                } else {
+                                    "Unreferenced".to_string()
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.reference_channel, None, "None");
+                                    for (i, name) in self.channel_names.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.reference_channel,
+                                            Some(i),
+                                            name,
+                                        );
+                                    }
+                                });
+                        });
+
                         // Stream information
                         ui.group(|ui| {
                             ui.label("Connected Stream Info:");
@@ -531,16 +576,27 @@ impl eframe::App for LslViewer {
 
                         plot.show(ui, |plot_ui| {
                             // Find the most recent timestamp to use as reference
-                            let mut latest_timestamp: f64 = 0.0;
-                            for channel_data in &self.data_buffer {
-                                if let Some(&(timestamp, _)) = channel_data.back() {
-                                    latest_timestamp = latest_timestamp.max(timestamp);
-                                }
-                            }
+                            let latest_timestamp =
+                                self.timestamp_buffer.back().cloned().unwrap_or(0.0);
 
                             // decide on the current time window to be shown (always n * TIME_WINDOW_SECONDS, where n is an integer)
                             let t0 =
                                 latest_timestamp - (latest_timestamp % self.time_window_seconds);
+
+                            // if we're re-referencing, prepare the reference channel
+                            let ref_channel: Option<(Vec<f32>, f64)> =
+                                if let Some(ref_idx) = self.reference_channel {
+                                    if ref_idx < self.data_buffer.len() {
+                                        Some((
+                                            self.data_buffer[ref_idx].iter().cloned().collect(),
+                                            self.channel_baselines[ref_idx],
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
 
                             let mut plot_idx = 0;
                             let mut t_last = 0.0;
@@ -557,11 +613,24 @@ impl eframe::App for LslViewer {
 
                                     let n = self.downsample_factor.max(1);
 
-                                    for &(timestamp, value) in channel_data.iter().step_by(n) {
+                                    for (i, (value, timestamp)) in channel_data
+                                        .iter()
+                                        .step_by(n)
+                                        .zip(self.timestamp_buffer.iter().step_by(n))
+                                        .enumerate()
+                                    {
                                         // We show a rolling window of data, so that new data is drawn from left to right
                                         let mut t = (timestamp - t0) % self.time_window_seconds;
-                                        let v =
-                                            (value as f64 - baseline) * self.data_scale / 10000.0;
+
+                                        let v = if let Some(ref ref_data) = ref_channel {
+                                            (*value as f64 - baseline)
+                                                - (ref_data.0[i] as f64 - ref_data.1)
+                                        } else {
+                                            (*value as f64 - baseline)
+                                        };
+
+                                        let v = v * self.data_scale / 10000.0;
+
                                         let val = v + -1.0 * plot_idx as f64;
 
                                         if t > 0.0 {
@@ -612,15 +681,8 @@ impl eframe::App for LslViewer {
                             ui.label(format!("Total samples buffered: {}", total_samples));
 
                             if let Some(channel_data) = self.data_buffer.first() {
-                                if let Some(&(last_time, _)) = channel_data.back() {
+                                if let Some(&last_time) = channel_data.back() {
                                     ui.label(format!("Last timestamp: {:.3}", last_time));
-                                }
-                                if let Some(&(first_time, _)) = channel_data.front() {
-                                    let duration = channel_data
-                                        .back()
-                                        .map(|&(t, _)| t - first_time)
-                                        .unwrap_or(0.0);
-                                    ui.label(format!("Buffered duration: {:.2}s", duration));
                                 }
                             }
                         });

@@ -9,7 +9,4 @@ egui = "0.31.1"
 egui_plot = "0.32.1"
 lsl = { git = "https://github.com/labstreaminglayer/liblsl-rust" }
 crossbeam-channel = "0.5"
-egui_tiles = "0.12.0"
-taffy = "0.8.3"
-egui_taffy = "0.7.0"
-rubato = "0.16.2"
+ndarray = "0.16.1"
